@@ -1,0 +1,21 @@
+name: discord-native-live
+version: "0.1.1"
+manifest_version: 2
+kind: standalone
+description: Native GPT-Live in Discord with independent Hermes task threads. Experimental; cloud audio.
+author: chrishart0
+license: MIT
+homepage: https://github.com/chrishart0/hermes-discord-native-live
+tags: [voice, discord, gpt-live]
+requires_hermes: ">=0.21.3"
+provides_tools:
+  - discord_live_work
+provides_hooks:
+  - pre_gateway_dispatch
+optional_env:
+  - OPENAI_API_KEY
+config_schema:
+  max_jobs:
+    type: int
+    default: 4
+    description: Maximum simultaneous requests through this adapter, between 2 and 16. Excess work is rejected, never run inline.

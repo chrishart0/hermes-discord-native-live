@@ -1,0 +1,36 @@
+name: Bug report
+description: Report a reproducible plugin problem without private audio or credentials.
+title: "[Bug]: "
+body:
+  - type: input
+    id: versions
+    attributes:
+      label: Plugin and Hermes versions/commits
+      description: Include both exact versions or commit hashes.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Gateway OS and Python version
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps, expected behavior, and observed behavior
+      description: Distinguish text tasks, audio, and task cancellation. Use non-sensitive examples.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted errors
+      description: No API keys, bot tokens, customer data, private audio, or raw transcripts.
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed credentials and private information from this report.
+          required: true

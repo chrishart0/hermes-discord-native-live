@@ -1,0 +1,2 @@
+# Compatibility for existing developer scripts; pyproject.toml owns dependencies.
+.

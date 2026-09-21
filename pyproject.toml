@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-discord-native-live"
+version = "0.1.1"
+description = "Native GPT-Live in Discord with independent Hermes task threads"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+authors = [{name = "chrishart0"}]
+# Shared dependency ranges allow Hermes's own constraints to remain authoritative.
+# No Hermes, Discord, torch or local speech runtime is installed by this plugin.
+dependencies = ["aiohttp>=3.9,<4", "numpy>=1.26,<3", "soxr==1.0.0"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "PyYAML>=6,<7"]
+
+[project.urls]
+Homepage = "https://github.com/chrishart0/hermes-discord-native-live"
+Repository = "https://github.com/chrishart0/hermes-discord-native-live"
+Issues = "https://github.com/chrishart0/hermes-discord-native-live/issues"
+
+# Keep the native directory-plugin layout; packaging adds no second entry point.
+[tool.setuptools]
+packages = ["discord_native_live"]
+package-dir = {discord_native_live = "."}
+
+[tool.setuptools.package-data]
+discord_native_live = ["plugin.yaml"]
