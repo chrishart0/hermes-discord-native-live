@@ -2,9 +2,9 @@
 
 
 def register(ctx):
-    from .plugin import Plugin
+    from .plugin import DiscordLivePlugin
 
-    plugin = Plugin(ctx)
+    plugin = DiscordLivePlugin(ctx)
     ctx.register_hook("pre_gateway_dispatch", plugin.capture_command)
     ctx.register_command(
         "live-discord", plugin.command,

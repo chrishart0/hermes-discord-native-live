@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.2 — 2026-09-21
+
+- Separate request identity, per-turn status and immutable voice updates; later background results are no longer suppressed by an initial acknowledgement.
+- Cancel and await pending startup before closing provider or Discord resources.
+- Count admission reservations once and retain native background-work status.
+- Name the task bridge, voice session and Live connection explicitly; isolate the receiver tap and make status commands read-only.
+- Keep existing shared-gateway context protection, native approvals and text delivery.
+- Add lifecycle/continuation regressions and pinned-host checks using actual admission functions and the background-delegation registry.
+
+Still experimental; real Discord/GPT-Live microphone testing is required.
+
 ## 0.1.1 — 2026-09-21
 
 - Publish as `chrishart0/hermes-discord-native-live`, a standalone public repository.

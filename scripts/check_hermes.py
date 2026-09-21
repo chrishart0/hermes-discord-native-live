@@ -1,11 +1,4 @@
-"""Run in a disposable CI profile with a real installed Hermes checkout.
-
-Uses native installer and PluginManager, never a fake registration context.
-No bot token, model key, microphone or paid network call is needed. The installer
-clones the current local git commit, runs its normal security/dependency checks,
-and enables it. CI accepts caution for its own reviewed source; dangerous scan
-verdicts remain blocked. This is not a live-audio/agent-execution test.
-"""
+"""Install/load this commit in a disposable real Hermes profile; never open audio."""
 from __future__ import annotations
 
 import importlib
@@ -35,32 +28,30 @@ def main():
         from hermes_cli.plugins_cmd import cmd_install
         cmd_install(ROOT.as_uri(), enable=True, force=True)
         installed = home / "plugins" / "discord-native-live"
-        assert (installed / "plugin.yaml").is_file(), "Installer did not use the manifest name"
-        assert (installed / "pyproject.toml").is_file(), "Dependency metadata missing"
+        assert (installed / "plugin.yaml").is_file()
+        assert (installed / "pyproject.toml").is_file()
         assert (installed / "live.py").read_bytes() == (ROOT / "live.py").read_bytes()
 
         from hermes_cli.plugins import PluginManager
         manager = PluginManager()
-        with patch("aiohttp.ClientSession", side_effect=AssertionError("Plugin loading must not start voice")):
+        with patch("aiohttp.ClientSession", side_effect=AssertionError("Loading must not start voice")):
             manager.discover_and_load()
         rows = [r for r in manager.list_plugins() if r["name"] == "discord-native-live"]
         assert len(rows) == 1, rows
         row = rows[0]
         assert row["enabled"] and not row["error"], row
         assert row["tools"] == 1 and row["hooks"] == 1 and row["commands"] == 1, row
-        loaded = manager._plugins[row["key"]]
-        module = loaded.module
+        module = manager._plugins[row["key"]].module
         runtime = importlib.import_module(module.__name__ + ".native")
         transport = importlib.import_module(module.__name__ + ".live")
+        audio = importlib.import_module(module.__name__ + ".audio")
 
-        # Real config/model helper and real Discord signatures, not stand-ins.
         from tools import voice_live
         assert voice_live.build_session_config()["delegation"]["type"] == "client"
         from plugins.platforms.discord.adapter import DiscordAdapter, VoiceReceiver
         for name in ("join_voice_channel", "leave_voice_channel", "play_in_voice_channel", "get_user_voice_channel"):
             assert callable(getattr(DiscordAdapter, name))
         assert "source" in inspect.signature(DiscordAdapter.join_voice_channel).parameters
-        assert callable(VoiceReceiver.map_ssrc)
         from gateway.run import GatewayRunner
         assert "source" in inspect.signature(GatewayRunner._run_agent).parameters
         from gateway.session_identity import replace_source
@@ -70,10 +61,22 @@ def main():
         a = replace_source(source, chat_id="201", thread_id="201", parent_chat_id="100", chat_type="thread")
         b = replace_source(source, chat_id="202", thread_id="202", parent_chat_id="100", chat_type="thread")
         assert build_session_key(a) != build_session_key(b)
-        assert runtime.owner(a) == runtime.owner(b)
+        assert runtime.TaskOwner.from_source(a) == runtime.TaskOwner.from_source(b)
         assert list(transport.append_chunks("loader check")) == ["loader check"]
+
+        # Exercise the real receiver's buffer/flush contract without sockets or codecs.
+        receiver = VoiceReceiver(None, allowed_user_ids={"42"})
+        capture = audio.Capture(42)
+        old_buffers = receiver._buffers
+        tap = audio.ReceiverTap(receiver, capture)
+        receiver.map_ssrc(7, 42)
+        receiver._buffers[7].extend(audio.SILENCE)
+        assert capture.queue.qsize() == 1
+        assert receiver.check_silence() == [] and receiver.flush_pending() == []
+        tap.close()
+        assert receiver._buffers is old_buffers
         manager.unload()
-        print(json.dumps({"native_install": "passed", "native_load": "passed", "native_signatures": "passed", "registration": row, "live_audio": "not tested"}, indent=2))
+        print(json.dumps({"native_install": "passed", "native_load": "passed", "receiver_contract": "passed", "registration": row, "live_audio": "not tested"}, indent=2))
 
 
 if __name__ == "__main__":

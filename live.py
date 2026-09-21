@@ -5,16 +5,14 @@ import asyncio
 import base64
 import json
 from collections import deque
+from collections.abc import Callable, Iterator
 from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 
 
-def append_chunks(text: str):
-    """<=400 UTF-8 bytes also bounds byte-tokenizers below the 500-token cap.
-
-    Unlike the Desktop character estimate, this holds for non-English text too.
-    """
+def append_chunks(text: str) -> Iterator[str]:
+    """Leave headroom under Live's append limit, including multibyte text."""
     chunk, size = [], 0
     for char in text:
         n = len(char.encode("utf-8"))
@@ -28,7 +26,7 @@ def append_chunks(text: str):
 
 
 def native_settings():
-    # Narrow, version-checked private seam; do not clone credential or persona policy.
+    # Hermes owns credential precedence and the voice persona.
     from tools import voice_live
 
     config = voice_live.build_session_config()
@@ -43,17 +41,26 @@ def native_settings():
     return config, key, endpoint
 
 
-class Live:
-    def __init__(self, on_delegation, on_audio):
-        self.on_delegation, self.on_audio = on_delegation, on_audio
-        self.http = self.ws = self.reader = None
+class LiveConnection:
+    def __init__(
+        self,
+        on_delegation: Callable[[str, str, str], None],
+        on_audio: Callable[[bytes], None],
+    ):
+        self.on_delegation = on_delegation
+        self.on_audio = on_audio
+        self.http: aiohttp.ClientSession | None = None
+        self.ws: aiohttp.ClientWebSocketResponse | None = None
+        self.reader: asyncio.Task | None = None
+        self._opening: asyncio.Task | None = None
         self.started = asyncio.Event()
         self.finalized = asyncio.Event()
         self.transcript = deque(maxlen=80)
         self.pending_user = ""
         self.seen: set[str] = set()
-        self.sent: set[str] = set()
         self.send_lock = asyncio.Lock()
+        self.reply_lock = asyncio.Lock()
+        self.closing = False
         self.closed = False
         self.provider_closed = False
         self.close_lock = asyncio.Lock()
@@ -61,24 +68,32 @@ class Live:
         self.usage = None
         self.model = self.voice = None
 
-    async def start(self):
-        config, key, endpoint = await asyncio.to_thread(native_settings)
-        self.model = config["model"]
-        self.voice = config["audio"]["output"]["voice"]
-        self.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, sock_connect=15))
+    async def start(self) -> None:
+        if self.closing or self._opening is not None:
+            raise RuntimeError("A Live connection can only be started once")
+        self._opening = asyncio.create_task(self._open(), name="discord-live:open")
         try:
-            self.ws = await self.http.ws_connect(
-                endpoint, headers={"Authorization": f"Bearer {key}"},
-                heartbeat=20, max_msg_size=2 * 1024 * 1024,
-            )
-            self.reader = asyncio.create_task(self.receive(), name="discord-live:receive")
-            await self.send({"type": "session.start", "session": config})
-            await asyncio.wait_for(self.started.wait(), 20)
-            if self.error or self.finalized.is_set():
-                raise RuntimeError(self.error or "Live session ended before audio started")
+            await self._opening
         except BaseException:
             await self.close()
             raise
+
+    async def _open(self) -> None:
+        config, key, endpoint = await asyncio.to_thread(native_settings)
+        self.model = config["model"]
+        self.voice = config["audio"]["output"]["voice"]
+        self.http = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=None, sock_connect=15)
+        )
+        self.ws = await self.http.ws_connect(
+            endpoint, headers={"Authorization": f"Bearer {key}"},
+            heartbeat=20, max_msg_size=2 * 1024 * 1024,
+        )
+        self.reader = asyncio.create_task(self.receive(), name="discord-live:receive")
+        await self.send({"type": "session.start", "session": config})
+        await asyncio.wait_for(self.started.wait(), 20)
+        if self.error or self.finalized.is_set():
+            raise RuntimeError(self.error or "Live session ended before audio started")
 
     async def send(self, event: dict):
         async with self.send_lock:
@@ -91,19 +106,18 @@ class Live:
             await self.send({"type": "session.input_audio.append", "audio": base64.b64encode(pcm).decode("ascii")})
 
     async def append(self, text: str, delegation_id: str | None = None, *, spoken=False):
+        if self.closing:
+            return
         for part in append_chunks(text):
             await self.send({
                 "type": "session.commentary.append" if spoken else "session.thinking.append",
                 "delegation_id": delegation_id, "content": part,
             })
 
-    async def result(self, delegation_id: str, text: str):
-        if self.closed or delegation_id in self.sent:
-            return
-        # Per-connection dedup only. On any partial send failure close the voice
-        # rather than replay an answer whose audible extent cannot be known.
-        self.sent.add(delegation_id)
-        await self.append(text[:1600], delegation_id, spoken=True)
+    async def speak(self, delegation_id: str, text: str) -> None:
+        async with self.reply_lock:
+            if not self.closing:
+                await self.append(text[:1600], delegation_id, spoken=True)
 
     async def event(self, event: dict):
         kind = event.get("type")
@@ -173,7 +187,13 @@ class Live:
             self.started.set()
             self.finalized.set()
 
-    async def close(self):
+    async def close(self) -> None:
+        self.closing = True
+        # Wait for the resource producer to stop before cleaning what it created.
+        opening = self._opening
+        if opening is not None and not opening.done():
+            opening.cancel()
+            await asyncio.gather(opening, return_exceptions=True)
         async with self.close_lock:
             if self.closed:
                 return

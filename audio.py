@@ -69,11 +69,11 @@ class _FrameSink:
 
 
 class ReceiverSink(MutableMapping):
-    """A scoped replacement for VoiceReceiver._buffers, not its packet decoder.
+    """Compatibility shim for Hermes's private decoded-PCM buffer slot.
 
-    The native receiver calls _buffers[ssrc].extend(decoded_pcm). Iteration stays
-    empty: its batch/silence/flush paths have no utterances to transcribe. Unknown
-    identities are never inferred. No subclass or copy of the crypto/Opus code.
+    The decoder writes through ``[ssrc].extend``. Empty iteration prevents
+    native silence/flush code from treating streamed frames as batch input.
+    Keep this workaround confined here until Hermes offers a PCM callback.
     """
 
     def __init__(self, capture: Capture):
@@ -95,7 +95,35 @@ class ReceiverSink(MutableMapping):
         return 0
 
 
-class Audio:
+class ReceiverTap:
+    """Own and restore the two receiver hooks used by streaming capture."""
+
+    def __init__(self, receiver, capture: Capture):
+        self.receiver = receiver
+        self.capture = capture
+        self.original_map = receiver.map_ssrc
+        self.sink = ReceiverSink(capture)
+        self.map_callback = self._map_speaker
+        receiver.map_ssrc = self.map_callback
+        with receiver._lock:
+            self.original_buffers = receiver._buffers
+            receiver._buffers = self.sink
+            self.original_buffers.clear()
+
+    def _map_speaker(self, ssrc: int, user_id: int) -> None:
+        self.original_map(ssrc, user_id)
+        self.capture.map_speaker(ssrc, user_id)
+
+    def close(self) -> None:
+        self.capture.close()
+        with self.receiver._lock:
+            if self.receiver._buffers is self.sink:
+                self.receiver._buffers = self.original_buffers
+        if self.receiver.map_ssrc is self.map_callback:
+            self.receiver.map_ssrc = self.original_map
+
+
+class DuplexAudio:
     def __init__(self):
         self.input_resampler = soxr.ResampleStream(48000, 24000, 1, dtype="int16")
         self.output_resampler = soxr.ResampleStream(24000, 48000, 1, dtype="int16")

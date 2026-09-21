@@ -8,12 +8,11 @@ Selected: BasePlatformAdapter.handle_message, _start_session_processing,
 _track_session_task; build_session_key plus its two key helpers.
 Only annotations/comments/docstrings are reduced. Platform identity resolution,
 LLM execution, Discord I/O and persistence are separately faked by the harness.
-With HERMES_SOURCE set, tests load these methods directly from that checkout's
-AST instead, so a changed upstream admission path fails instead of being hidden.
+With HERMES_SOURCE set, tests import the real installed checkout's functions
+instead. Lower execution and network boundaries remain mocked.
 """
 from __future__ import annotations
 
-import ast
 import asyncio
 import logging
 import os
@@ -121,28 +120,20 @@ class Admission:
 
 
 def load_checkout():
-    """Use real upstream method bodies when an actual checkout is supplied."""
+    """Use the installed checkout's real functions in the pinned-host CI job."""
     root = os.environ.get("HERMES_SOURCE")
     if not root:
         return
-    root = Path(root)
-    specs = [
-        ("gateway/session.py", None, ["_session_key_namespace", "_canonical_participant", "build_session_key"]),
-        ("gateway/platforms/base.py", "BasePlatformAdapter", ["handle_message", "_start_session_processing", "_track_session_task"]),
-    ]
-    for filename, class_name, names in specs:
-        tree = ast.parse((root / filename).read_text())
-        parent = tree if class_name is None else next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == class_name)
-        selected = [n for n in parent.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names]
-        assert {n.name for n in selected} == set(names), "Hermes admission layout changed"
-        namespace = dict(globals())
-        module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *selected], type_ignores=[])
-        ast.fix_missing_locations(module)
-        exec(compile(module, str(root / filename), "exec"), namespace)
-        for name in names:
-            if class_name:
-                setattr(Admission, name, namespace[name])
-            else:
-                globals()[name] = namespace[name]
+    import sys
+    sys.path.insert(0, str(Path(root).resolve()))
+    from gateway.platforms.base import BasePlatformAdapter
+    from gateway.config import Platform as HostPlatform
+    from gateway.session import build_session_key as host_session_key
+
+    globals()["Platform"] = HostPlatform
+    globals()["build_session_key"] = host_session_key
+    for name in ("handle_message", "_start_session_processing", "_track_session_task"):
+        setattr(Admission, name, getattr(BasePlatformAdapter, name))
+
 
 load_checkout()

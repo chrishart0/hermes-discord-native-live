@@ -1,5 +1,5 @@
 name: discord-native-live
-version: "0.1.1"
+version: "0.1.2"
 manifest_version: 2
 kind: standalone
 description: Native GPT-Live in Discord with independent Hermes task threads. Experimental; cloud audio.
@@ -18,4 +18,4 @@ config_schema:
   max_jobs:
     type: int
     default: 4
-    description: Maximum simultaneous requests through this adapter, between 2 and 16. Excess work is rejected, never run inline.
+    description: Maximum active turns or live background delegations through this adapter, between 2 and 16. Excess requests are rejected.
