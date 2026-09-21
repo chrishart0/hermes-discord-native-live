@@ -213,6 +213,7 @@ def host(monkeypatch):
     modules = {
         "gateway.platforms.event": types.SimpleNamespace(MessageEvent=Event, MessageType=types.SimpleNamespace(TEXT="text", COMMAND="command")),
         "gateway.session_identity": types.SimpleNamespace(replace_source=replace_source),
+        "tools.async_delegation": types.SimpleNamespace(has_live_for_session=lambda **_: False),
         "tools.voice_live": types.SimpleNamespace(voice_live_turn_note=lambda text: "native note:" + text),
         "discord": types.SimpleNamespace(ChannelType=types.SimpleNamespace(public_thread=11), AllowedMentions=types.SimpleNamespace(none=lambda: None), TextChannel=Channel),
     }
@@ -221,11 +222,12 @@ def host(monkeypatch):
     gateway = Gateway()
     adapter = Adapter(gateway)
     gateway._delivery_adapter_for = lambda source: adapter
-    from discord_native_live.native import Native
+    from discord_native_live.native import HermesTaskBridge
     notices = []
-    native = Native(gateway, adapter, notices.append)
+    native = HermesTaskBridge(gateway, adapter)
+    native.attach(lambda _: False)
     channel = Channel()
     source = Source()
     source._identity = object()
-    voice = types.SimpleNamespace(source=source, channel=channel, max_jobs=4, native=native, closed=False)
+    voice = types.SimpleNamespace(source=source, channel=channel, max_jobs=4, bridge=native, closing=False, closed=False, publish=notices.append)
     return types.SimpleNamespace(gateway=gateway, adapter=adapter, native=native, voice=voice, notices=notices)

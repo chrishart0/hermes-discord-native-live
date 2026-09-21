@@ -1,10 +1,9 @@
-import dataclasses
 import types
 
 import pytest
 
 from conftest import Event, Source
-from discord_native_live.plugin import Plugin
+from discord_native_live.plugin import DiscordLivePlugin
 
 
 class Context:
@@ -13,7 +12,7 @@ class Context:
 
 
 def test_command_capture_only_records_until_native_auth_dispatch(host):
-    plugin = Plugin(Context())
+    plugin = DiscordLivePlugin(Context())
     event = Event("/live-discord join")
     result = plugin.capture_command(event=event, gateway=host.gateway)
     assert result["action"] == "rewrite"
@@ -23,31 +22,31 @@ def test_command_capture_only_records_until_native_auth_dispatch(host):
 
 
 async def test_command_tickets_are_single_use_and_not_global_last_sender(host):
-    plugin = Plugin(Context())
+    plugin = DiscordLivePlugin(Context())
     a = plugin.capture_command(event=Event("/live-discord status"), gateway=host.gateway)
     b = plugin.capture_command(event=Event("/live-discord status", Source(user_id="99")), gateway=host.gateway)
     assert a["text"] != b["text"]
     tickets = list(plugin.tickets.values())
-    assert [r[1].source.user_id for r in tickets] == ["42", "99"]
+    assert [r.event.source.user_id for r in tickets] == ["42", "99"]
     assert "no authenticated" in await plugin.command("made-up-ticket")
 
 
 def test_capture_declines_internal_or_noncontrol_voice_input(host):
-    plugin = Plugin(Context())
+    plugin = DiscordLivePlugin(Context())
     for event in [Event("/live-discord join", internal=True), Event("/live-discord join", allow_gateway_control=False)]:
         assert plugin.capture_command(event=event, gateway=host.gateway) is None
     assert not plugin.tickets
 
 
 def test_pending_command_tickets_are_bounded(host):
-    plugin = Plugin(Context())
+    plugin = DiscordLivePlugin(Context())
     for _ in range(200):
         plugin.capture_command(event=Event("/live-discord status"), gateway=host.gateway)
     assert len(plugin.tickets) == 128
 
 
 def test_work_tool_denies_nonvoice_execution():
-    plugin = Plugin(Context())
+    plugin = DiscordLivePlugin(Context())
     assert "error" in plugin.work_tool({"action": "cancel", "thread_id": "201"})
 
 

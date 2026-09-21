@@ -3,7 +3,7 @@ import threading
 import numpy as np
 import pytest
 
-from discord_native_live.audio import Audio, Capture, DISCORD_BYTES, ReceiverSink, SILENCE
+from discord_native_live.audio import DuplexAudio, Capture, DISCORD_BYTES, ReceiverSink, SILENCE
 
 
 def test_unknown_other_speaker_never_reaches_capture_queue():
@@ -49,7 +49,7 @@ def test_capture_close_stops_forwarding():
 
 
 def test_resampling_is_stateful_and_rate_correct():
-    audio = Audio()
+    audio = DuplexAudio()
     total = 0
     for _ in range(100):
         data, voiced = audio.input(SILENCE)
@@ -60,7 +60,7 @@ def test_resampling_is_stateful_and_rate_correct():
 
 
 def test_output_is_48k_stereo_twenty_millisecond_frames():
-    audio = Audio()
+    audio = DuplexAudio()
     samples = np.ones(24000, dtype=np.int16) * 1000
     audio.output(samples.astype("<i2").tobytes())
     frames = [audio.read() for _ in range(40)]
@@ -71,7 +71,7 @@ def test_output_is_48k_stereo_twenty_millisecond_frames():
 
 
 def test_sustained_barge_in_clears_playback_not_work():
-    audio = Audio()
+    audio = DuplexAudio()
     audio.output((np.ones(24000, dtype=np.int16) * 1000).tobytes())
     voiced = (np.ones(DISCORD_BYTES // 2, dtype=np.int16) * 2000).tobytes()
     for _ in range(4):
@@ -87,12 +87,12 @@ def test_sustained_barge_in_clears_playback_not_work():
 
 
 def test_playback_close_returns_eof():
-    audio = Audio()
+    audio = DuplexAudio()
     audio.close()
     assert audio.read() == b""
 
 
 def test_oversized_playback_is_bounded():
-    audio = Audio()
+    audio = DuplexAudio()
     with pytest.raises(RuntimeError, match="five-second"):
         audio.output(np.zeros(24000 * 6, dtype="<i2").tobytes())

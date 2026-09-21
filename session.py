@@ -1,178 +1,206 @@
-"""One operator's audio lifetime; native Hermes work has a separate lifetime."""
+"""One Discord voice call. Closing audio does not cancel native task threads."""
 from __future__ import annotations
 
 import asyncio
-import time
 import logging
+import time
 
-log = logging.getLogger(__name__)
+from .audio import Capture, DuplexAudio, ReceiverTap
+from .live import LiveConnection
+from .native import TaskUpdate
 
-from .audio import Audio, Capture, ReceiverSink
-from .live import Live
+logger = logging.getLogger(__name__)
 
 
-class Session:
-    def __init__(self, plugin, native, event, channel, voice_channel):
-        self.plugin, self.native = plugin, native
-        self.source, self.channel, self.voice_channel = event.source, channel, voice_channel
+class DiscordVoiceSession:
+    def __init__(self, plugin, bridge, event, channel, voice_channel):
+        self.plugin = plugin
+        self.bridge = bridge
+        self.source = event.source
+        self.channel = channel
+        self.voice_channel = voice_channel
         self.guild_id = int(self.source.scope_id or self.source.guild_id)
-        with native.gateway._profile_scope_for_source(self.source):
+        with bridge.gateway._profile_scope_for_source(self.source):
             self.max_jobs = int(plugin.ctx.get_config("max_jobs", 4))
         if not 2 <= self.max_jobs <= 16:
             raise ValueError("discord-native-live max_jobs must be between 2 and 16")
-        self.audio = Audio()
+        self.audio = DuplexAudio()
         self.capture = Capture(int(self.source.user_id))
-        self.live = Live(self.delegate, self.output)
-        self.vc = self.receiver = self.player = self.loop_task = None
-        self.sink = None
-        self.original_buffers = self.original_map = self.map_callback = None
+        self.live = LiveConnection(self.delegate, self.output)
+        self.voice_client = None
+        self.tap: ReceiverTap | None = None
+        self.stream_task: asyncio.Task | None = None
+        self._opening: asyncio.Task | None = None
+        self.closing = False
         self.closed = False
         self.last_voice = time.monotonic()
         self.close_lock = asyncio.Lock()
 
-    async def start(self):
-        adapter = self.native.adapter
-        if adapter._voice_clients.get(self.guild_id):
+    @property
+    def key(self) -> tuple[int, int]:
+        return id(self.bridge.adapter), self.guild_id
+
+    async def start(self) -> None:
+        if self.closing or self._opening is not None:
+            raise RuntimeError("A Discord voice call can only be started once")
+        if self.bridge.adapter._voice_clients.get(self.guild_id):
             raise RuntimeError("Leave the existing voice connection first with /voice leave")
+        self._opening = asyncio.create_task(self._open(), name="discord-live:join")
         try:
-            # Connect Live before opening Discord, so the old batch listener has
-            # no provider-handshake interval in which to submit an unwanted turn.
-            with self.native.gateway._profile_scope_for_source(self.source):
-                await self.live.start()
-                joined = await adapter.join_voice_channel(
-                    self.voice_channel, text_channel_id=self.channel.id, source=self.source.to_dict())
-            if not joined:
-                raise RuntimeError("Hermes could not join this Discord voice channel")
-            self.vc = adapter._voice_clients[self.guild_id]
-            self.receiver = adapter._voice_receivers.get(self.guild_id)
-            if (self.receiver is None or not callable(getattr(self.receiver, "map_ssrc", None))
-                    or not hasattr(self.receiver, "_buffers") or not hasattr(self.receiver, "_lock")):
-                raise RuntimeError("Hermes did not provide a compatible voice receiver")
-            listener = adapter._voice_listen_tasks.pop(self.guild_id, None)
-            if listener:
-                listener.cancel()
-                await asyncio.gather(listener, return_exceptions=True)
-            receiver = self.receiver
-            self.original_map = receiver.map_ssrc
-
-            def map_speaker(ssrc, user_id):
-                self.original_map(ssrc, user_id)
-                self.capture.map_speaker(ssrc, user_id)
-
-            self.map_callback = map_speaker
-            receiver.map_ssrc = map_speaker
-            # Existing maps might include Hermes's sole-member inference. Only
-            # subsequent genuine SPEAKING opcodes are admitted to cloud audio.
-            self.sink = ReceiverSink(self.capture)
-            with receiver._lock:
-                self.original_buffers = receiver._buffers
-                receiver._buffers = self.sink
-                self.original_buffers.clear()
-            self.vc.stop()
-            adapter._voice_mixers.pop(self.guild_id, None)
-            self.player = self.audio.source()
-            self.vc.play(self.player)
-            self.loop_task = self.plugin.spawn(self.stream(), "audio")
+            await self._opening
         except BaseException:
             await self.close()
             raise
 
-    def output(self, pcm):
+    async def _open(self) -> None:
+        adapter = self.bridge.adapter
+        # Establish the provider first; do not leave batch STT running during its handshake.
+        with self.bridge.gateway._profile_scope_for_source(self.source):
+            await self.live.start()
+            joined = await adapter.join_voice_channel(
+                self.voice_channel, text_channel_id=self.channel.id, source=self.source.to_dict()
+            )
+        if not joined:
+            raise RuntimeError("Hermes could not join this Discord voice channel")
+        self.voice_client = adapter._voice_clients[self.guild_id]
+        receiver = adapter._voice_receivers.get(self.guild_id)
+        if (receiver is None or not callable(getattr(receiver, "map_ssrc", None))
+                or not hasattr(receiver, "_buffers") or not hasattr(receiver, "_lock")):
+            raise RuntimeError("Hermes did not provide a compatible voice receiver")
+        listener = adapter._voice_listen_tasks.pop(self.guild_id, None)
+        if listener is not None:
+            listener.cancel()
+            await asyncio.gather(listener, return_exceptions=True)
+        # Existing maps may contain native sole-member inference. Admit only new SPEAKING events.
+        self.tap = ReceiverTap(receiver, self.capture)
+        self.voice_client.stop()
+        adapter._voice_mixers.pop(self.guild_id, None)
+        self.voice_client.play(self.audio.source())
+        self.stream_task = self.plugin.spawn(self.stream(), "audio")
+
+    def output(self, pcm: bytes) -> None:
         self.audio.output(pcm)
         if pcm:
             self.last_voice = time.monotonic()
 
-    def delegate(self, delegation_id, prompt, context):
-        if not self.closed:
+    def delegate(self, delegation_id: str, prompt: str, context: str) -> None:
+        if not self.closing:
             self.plugin.spawn(self.dispatch(delegation_id, prompt, context), "dispatch")
 
-    async def dispatch(self, delegation_id, prompt, context):
+    async def dispatch(self, delegation_id: str, prompt: str, context: str) -> None:
+        if self.closing:
+            return
         try:
-            if self.closed:
-                return
-            job = await self.native.submit(self, delegation_id, prompt, context)
-            if not self.closed:
-                await self.live.append(f"Hermes accepted task {job.id}: {prompt[:120]}. It is not finished.", delegation_id)
+            task = await self.bridge.submit(self, delegation_id, prompt, context)
+            if not self.closing:
+                await self.live.append(
+                    f"Hermes accepted task {task.thread_id}: {prompt[:120]}. It is not finished.",
+                    delegation_id,
+                )
         except Exception as exc:
-            if not self.closed:
-                # Locally generated errors only; avoid vendor request bodies.
-                text = str(exc) if isinstance(exc, (ValueError, PermissionError, RuntimeError)) else "Task submission failed; check the associated text channel."
-                await self.live.result(delegation_id, text[:500])
+            if not self.closing:
+                text = str(exc) if isinstance(exc, (ValueError, PermissionError, RuntimeError)) else (
+                    "Task submission failed; check the associated text channel."
+                )
+                await self.live.speak(delegation_id, text[:500])
 
-    async def stream(self):
+    def publish(self, update: TaskUpdate) -> None:
+        if not self.closing:
+            self.plugin.spawn(self.deliver(update), "result")
+
+    async def deliver(self, update: TaskUpdate) -> None:
+        if self.closing:
+            return
+        text = update.text or "This Hermes turn ended without a spoken reply; check its text thread."
+        if update.turn_status in {"failed", "interrupted"}:
+            text = f"The Hermes turn {update.turn_status}. " + text
+        try:
+            await self.live.speak(
+                update.delegation_id, f"For your request {update.request[:100]!r}: {text}"
+            )
+        except Exception:
+            # Partial speech cannot be replayed reliably; keep the native text result instead.
+            self.live.error = f"Voice delivery failed for task {update.thread_id}; check its text thread."
+            await self.close()
+
+    def _still_connected(self) -> bool:
+        adapter = self.bridge.adapter
+        client = self.voice_client
+        if (not client.is_connected() or client.channel.id != self.voice_channel.id
+                or adapter._voice_clients.get(self.guild_id) is not client):
+            return False
+        if not self.bridge.authorized(self.source, voice=True):
+            return False
+        member = self.voice_channel.guild.get_member(int(self.source.user_id))
+        return bool(member and member.voice and member.voice.channel
+                    and member.voice.channel.id == self.voice_channel.id)
+
+    async def stream(self) -> None:
         loop = asyncio.get_running_loop()
         deadline = loop.time()
         checked = 0.0
         try:
-            while not self.closed and not self.live.finalized.is_set():
+            while not self.closing and not self.live.finalized.is_set():
                 now = loop.time()
                 if now - deadline > 0.25:
-                    raise RuntimeError("Voice event loop fell behind; no queued audio was replayed")
+                    raise RuntimeError("Voice event loop fell behind")
                 await asyncio.sleep(max(0.0, deadline - now))
                 pcm, voiced = self.audio.input(self.capture.read())
                 if voiced:
                     self.last_voice = time.monotonic()
                 if now - checked >= 1:
                     checked = now
-                    if (not self.vc.is_connected() or self.vc.channel.id != self.voice_channel.id
-                            or self.native.adapter._voice_clients.get(self.guild_id) is not self.vc):
+                    if not self._still_connected():
                         break
-                    if not self.native.authorized(self.source, voice=True):
-                        raise PermissionError("Voice operator authorization ended")
-                    member = self.voice_channel.guild.get_member(int(self.source.user_id))
-                    if not member or not member.voice or member.voice.channel.id != self.voice_channel.id:
-                        break
-                    timeout = self.native.adapter._voice_timeout_limit()
+                    timeout = self.bridge.adapter._voice_timeout_limit()
                     if timeout > 0 and time.monotonic() - self.last_voice >= timeout:
                         break
                     if time.monotonic() - self.last_voice < 2:
-                        self.native.adapter._reset_voice_timeout(self.guild_id)
+                        self.bridge.adapter._reset_voice_timeout(self.guild_id)
                 await self.live.audio(pcm)
                 deadline += 0.02
         except asyncio.CancelledError:
             raise
         except Exception:
-            self.live.error = "Live audio stopped. Existing Hermes tasks continue in their text threads."
+            self.live.error = "Live audio stopped; native task threads remain available."
         finally:
-            await self.close()
+            if not self.closing:
+                await self.close()
 
-    async def close(self):
+    async def close(self) -> None:
+        self.closing = True
+        self.capture.close()
+        self.audio.close()
+        self.bridge.detach_voice(self.publish)
+        opening = self._opening
+        if opening is not None and not opening.done():
+            opening.cancel()
+            await asyncio.gather(opening, return_exceptions=True)
         async with self.close_lock:
             if self.closed:
                 return
-            self.closed = True
-            self.capture.close()
-            self.audio.close()
-            adapter = self.native.adapter
+            adapter = self.bridge.adapter
             try:
-                if self.receiver:
-                    with self.receiver._lock:
-                        if self.sink is not None and self.receiver._buffers is self.sink:
-                            self.receiver._buffers = self.original_buffers
-                    if self.map_callback is not None and self.receiver.map_ssrc is self.map_callback:
-                        self.receiver.map_ssrc = self.original_map
-                if self.vc and adapter._voice_clients.get(self.guild_id) is self.vc:
+                if self.tap is not None:
+                    self.tap.close()
+                if self.voice_client and adapter._voice_clients.get(self.guild_id) is self.voice_client:
                     await asyncio.wait_for(adapter.leave_voice_channel(self.guild_id), 5)
             except Exception as exc:
-                # Closing Discord must never prevent closing the billed provider.
-                log.warning("Discord audio cleanup failed (%s)", type(exc).__name__)
+                logger.warning("Discord voice cleanup failed (%s)", type(exc).__name__)
             finally:
                 try:
-                    # No job cancellation: the native adapter owns submitted work.
                     await self.live.close()
                 finally:
-                    if self.loop_task and self.loop_task is not asyncio.current_task():
-                        self.loop_task.cancel()
+                    self.closed = True
+                    if self.stream_task and self.stream_task is not asyncio.current_task():
+                        self.stream_task.cancel()
+                        await asyncio.gather(self.stream_task, return_exceptions=True)
                     if self.plugin.sessions.get(self.key) is self:
-                        self.plugin.sessions.pop(self.key, None)
+                        self.plugin.sessions.pop(self.key)
             if self.live.error:
                 try:
                     await asyncio.wait_for(adapter.send(
-                        str(self.channel.id),
-                        self.live.error + " Existing work remains in its task threads."), 5)
+                        str(self.channel.id), self.live.error + " Existing work stays in its task threads."
+                    ), 5)
                 except Exception:
-                    log.warning("Could not deliver live-voice error notice")
-
-    @property
-    def key(self):
-        return (id(self.native.adapter), self.guild_id)
+                    logger.warning("Could not deliver the voice-close notice to channel %s", self.channel.id)

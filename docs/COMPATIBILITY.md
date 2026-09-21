@@ -1,51 +1,53 @@
-# Compatibility and design boundaries
+# Compatibility and integration boundaries
 
-Inspected against public NousResearch/hermes-agent commit `4b8a8134009a8727a289bcabeb0019fedd353128` on September 21, 2026. Runtime checks reject missing methods, but cannot prove semantic compatibility with every new release. A pinned-host installer/loader check is included in CI. No real microphone/Discord acceptance result is claimed.
+CI targets Hermes commit `4b8a8134009a8727a289bcabeb0019fedd353128`. Missing methods are checked at join, but semantic changes in later Hermes versions may require an update. Real Discord microphone testing is separate.
 
-## Native contracts used
+## Host dependencies
 
-| Area | Required surface |
+| Area | Integration point |
 | --- | --- |
-| Plugin loader | `register(ctx)`, `register_hook`, `register_command`, `register_tool`, `on_unload`, `get_config` |
-| Command context | `pre_gateway_dispatch(event, gateway)` rewrite, followed by native registered-command authorization |
-| Consent | `PluginContext._gateway_injection_allowed()`; existing per-plugin explicit grant |
-| Live configuration | `tools.voice_live.build_session_config`, `_live_section`, `_resolve_credentials`, `voice_live_turn_note` |
-| Native execution | `adapter.handle_message`, `MessageEvent._gateway_accepted`, gateway `_run_agent`, native completion callback |
-| Model choice | `_resolve_session_agent_runtime`, `async_session_store.get_or_create_session` / `set_model_override` |
-| Identity | native `replace_source`, profile scope, native authorization plus Discord voice-user/role check |
-| Voice transport | existing adapter voice client/receiver/listener/mixer maps and join/leave/timeout functions |
+| Registration | `register(ctx)`, hooks, commands, tools, `on_unload`, `get_config` |
+| Command context | `pre_gateway_dispatch` rewrite followed by native command authorization |
+| Consent | Existing `allow_gateway_injection` grant |
+| Live settings | `tools.voice_live` configuration, credential resolver and per-turn note |
+| Execution | `adapter.handle_message`, its admission receipt, gateway `_run_agent`, `on_processing_complete` |
+| Background status | `tools.async_delegation.has_live_for_session(session_key=...)` |
+| Model and routing | Native session store, model resolution, `replace_source` and profile scope |
+| Audio | Native Discord join/leave, receiver, playback and inactivity timeout |
 
-Native Live helpers inspected at Git blob `b9ab6f78639aa7adc7b08f8b416894d68d21e0c8`; plugin API at `15fa39d715479b4a71144e843a107ab3b3b2bdf2`. Test admission/key excerpt identities are recorded in `tests/hermes_snapshot.py`. Blob IDs identify inspected file versions, not an asserted released Hermes version.
+The registered-command API passes raw arguments rather than an event. A bounded, single-use ticket carries request context from the pre-dispatch hook to the authorized handler. Recording a ticket does not execute work or open audio.
 
-## Instance hooks, explicitly
+## Scoped private hooks
 
-The plugin temporarily replaces one receiver's `_buffers` mapping with a decoded-PCM sink and wraps `map_ssrc`. It does **not** copy packet decryption, DAVE, Opus decoding or Discord socket code. The batch listener is stopped during Live. Previously inferred speaker mappings are not trusted; only genuine subsequent SPEAKING callbacks admit the initiating user.
+`HermesTaskBridge.attach()` installs instance observers when joining, not when requesting status. An observer that does not own a turn forwards it without changing task context. Unload restores only hooks still owned by that bridge.
 
-It wraps a gateway instance's `_run_agent` to observe results/context and an adapter instance's `on_processing_complete` to announce them after native completion. It also suppresses that adapter's ordinary voice playback in a Live-owned guild. Wrappers return original results unchanged. Owned hooks are restored during teardown; a newer replacement is never overwritten. These are private integration points and can break on updates.
+`ReceiverTap` contains the private audio adaptation. Hermes's receiver normally calls `_buffers[ssrc].extend(decoded_pcm)`. The replacement mapping forwards that call to a bounded queue but exposes no completed utterances to batch STT. It wraps `map_ssrc` to admit only genuine subsequent SPEAKING events for the operator; inferred old mappings are not trusted. Closing the tap restores its buffers and callback only if still owned. Packet decryption and Opus decoding remain native.
 
-A dedicated supported raw-PCM callback and a task-completion observer would be preferable future upstream seams. That is not a reason to introduce a new provider framework or refactor Desktop in this plugin.
+These are version-sensitive hooks, not public extension APIs. A supported raw-PCM callback and a task-update observer would remove most of this compatibility cost. This plugin does not add a generic framework to anticipate those APIs.
 
-## Independent tasks, not fake asynchronous execution
+## Task and update lifetime
 
-Each delegation creates a real task thread before entering `BasePlatformAdapter.handle_message`. Native session keys therefore differ. Hermes owns execution, concurrency guards, approvals, limits, persistence and text delivery. There is no `AIAgent` construction or subprocess runner in the plugin. The in-memory job map holds only correlation/status for the current gateway process; it is not the execution authority.
+Each voice request creates a real Discord thread and distinct native session key. Hermes performs execution, approvals, persistence and text delivery. The selected parent model is pinned without copying credentials.
 
-Distinct sessions do not guarantee distinct filesystem workspaces. Concurrent edits to the same repository need the user's normal worktree/isolation practices. There is no added workspace manager. User/session-specific settings beyond the selected model are not silently copied.
+A `VoiceTask` retains request identity. Each runner result produces an immutable `TaskUpdate`; the completion callback drains those updates once. Later turns produce new updates for the same request. The Live connection accepts multiple spoken updates for one delegation ID. There is no permanent “already announced” flag that discards later results.
 
-## Boundaries and limitations
+Capacity counts a pending admission or an admitted active task, never both. A native live background delegation keeps a task active even when its parent turn is idle. This is a projection of Hermes state, not a scheduler. Future scheduled jobs and arbitrary background processes are not an exhaustive part of that status projection. An idle turn is never presented as proof all future work finished.
 
-Only one initiating speaker per call. Task threads are public **within their parent channel's visibility**. Ordinary native users with channel access can still interact through native text authorization; the plugin does not create a new access-control regime.
+Correlation is retained for the call, up to 128 requests. Ending voice detaches delivery; existing work continues as text. A new call does not replay old results. No durable voice-result inbox is added.
 
-Speech interruption drops queued local PCM, not backend jobs. A small energy gate is not AEC or a sophisticated turn detector. The Live service owns conversational turn-taking. Timing, natural interruptions, packet jitter, DAVE reconnect behavior and speech quality still need real-device testing.
+## Startup and shutdown
 
-Capture is bounded to roughly one second, playback to five seconds. Overruns stop voice instead of replaying stale audio. Provider shutdown is attempted even if Discord cleanup fails. A socket EOF is not treated as a confirmed `session.closed` usage receipt. No transcript/audio or provider error body is logged by plugin code; native platform/provider logging policies still apply.
+Both the provider connection and Discord call own their startup task. Close first cancels and awaits startup, then releases resources; late startup cannot allocate a provider client after cleanup. Discord cleanup failure does not skip provider close. Transport EOF is not a final billing receipt.
 
-No automatic speech replay on reconnect, crash-resilient voice-result inbox, rich progress tracing, voice approvals, local-speech fallback, other provider, browser, or separate dashboard is included.
+Speech interruption clears local playback, not native work. The energy gate is not an echo canceller or a full turn detector. Capture is bounded to about one second and playback to five seconds; overload stops voice instead of replaying stale audio. Actual latency, jitter, interruptions and reconnect behavior need a microphone test.
 
-## Protocol references
+Only one initiating operator is supported. Public task threads inherit parent-channel visibility. Native text authorization still applies to other channel participants. Independent task sessions do not isolate filesystems; simultaneous edits require ordinary worktree practices.
+
+## Protocol
+
+Primary GPT-Live WebSocket events are used, not the older Realtime `response.*` protocol. Provider audio is PCM16 mono at 24 kHz; Discord is 48 kHz stereo, resampled with streaming soxr.
 
 - https://developers.openai.com/api/docs/guides/voice-websockets
 - https://developers.openai.com/api/docs/guides/live-delegation
-- https://github.com/NousResearch/hermes-agent/blob/main/tools/voice_live.py
-- https://github.com/NousResearch/hermes-agent/blob/main/plugins/platforms/discord/adapter.py
-
-Primary Live WebSocket is used—not an older Realtime `response.*` protocol. Audio is PCM16 mono at 24 kHz; Discord frames are 48 kHz stereo, resampled with streaming soxr.
+- https://github.com/NousResearch/hermes-agent/blob/4b8a8134009a8727a289bcabeb0019fedd353128/tools/voice_live.py
+- https://github.com/NousResearch/hermes-agent/blob/4b8a8134009a8727a289bcabeb0019fedd353128/plugins/platforms/discord/adapter.py
